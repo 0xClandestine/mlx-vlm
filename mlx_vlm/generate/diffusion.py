@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import shutil
 import time
@@ -297,6 +298,66 @@ def _diffusion_token_entropy(processed_logits: mx.array) -> mx.array:
     log_probs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
     probs = mx.exp(log_probs)
     return -mx.sum(probs * log_probs, axis=-1)
+
+
+def _entropy_bound_to_margin(entropy_bound: float, vocab_size: int) -> float:
+    """Precompute the logit margin δ such that H(softmax(z)) < entropy_bound
+    implies z[0] - z[1] > δ, using a two-mass (Bernoulli) approximation.
+
+    The two-mass model is conservative: it slightly over-commits tokens
+    (never under-commits), so the acceptance gate errs on the side of
+    accepting fewer tokens rather than more.
+    """
+    lo, hi = 0.0, 30.0
+    for _ in range(64):
+        mid = (lo + hi) / 2.0
+        p1 = 1.0 / (1.0 + math.exp(-mid))
+        p2 = 1.0 - p1
+        h = -(p1 * math.log(p1 + 1e-12) + p2 * math.log(p2 + 1e-12))
+        if h > entropy_bound:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
+@mx.compile
+def _diffusion_token_entropy_margin(
+    processed_logits: mx.array,
+    margin_threshold: float,
+) -> mx.array:
+    """Return True where top-1 minus top-2 logit exceeds margin_threshold.
+
+    Equivalent to H(softmax(z)) < entropy_bound but reads only 2 values per
+    position instead of V.  Used directly in the verification suite and as
+    the inner kernel of _diffusion_acceptance_gate.
+    """
+    # mx.topk returns k values in ascending order; index -1 is the largest.
+    top2 = mx.topk(processed_logits.astype(mx.float32), k=2, axis=-1)
+    return (top2[..., 1] - top2[..., 0]) > margin_threshold
+
+
+@mx.compile
+def _diffusion_acceptance_gate(
+    logits: mx.array,
+    margin_threshold: float,
+    committed_mask: mx.array,
+) -> mx.array:
+    """Fused acceptance gate: zero out committed positions, compute top-2
+    logit margin, and threshold it.
+
+    Returns a bool mask (True = accept this step). Replaces the full softmax
+    entropy path in the entropy-bound sampler: reads 2 logit values per
+    position instead of V, and skips already-committed positions entirely.
+    """
+    active = mx.where(
+        committed_mask[..., None],
+        mx.array(-math.inf, dtype=mx.float32),
+        logits.astype(mx.float32),
+    )
+    # mx.topk returns k values in ascending order; index -1 is the largest.
+    top2 = mx.topk(active, k=2, axis=-1)  # [B, L, 2]
+    return (top2[..., 1] - top2[..., 0]) > margin_threshold
 
 
 def _diffusion_soft_embedding_weight(embed_tokens: nn.Module) -> mx.array:
@@ -610,6 +671,8 @@ def stream_diffusion_generate(
     )
     sampler_name = sampler_config.get("_cls_name", "EntropyBoundSamplerConfig")
     entropy_bound = float(sampler_config.get("entropy_bound", 0.1))
+    # Precomputed once per call — O(1) binary search, not per denoising step.
+    _margin_threshold = _entropy_bound_to_margin(entropy_bound, vocab_size)
     if sampler_name != "EntropyBoundSamplerConfig":
         raise NotImplementedError(
             f"Diffusion sampler {sampler_name!r} is not supported yet."
@@ -785,6 +848,9 @@ def stream_diffusion_generate(
                 input_ids.dtype,
             )
             draft_reveal_mask = mx.zeros(current_canvas.shape, dtype=mx.bool_)
+            # Tracks positions accepted in any prior step of this canvas so
+            # _diffusion_acceptance_gate can skip them entirely.
+            committed_mask = mx.zeros((batch_size, canvas_length), dtype=mx.bool_)
             draft_canvas = current_canvas
             accepted_canvas = current_canvas
             argmax_canvas = current_canvas
@@ -881,21 +947,20 @@ def stream_diffusion_generate(
                 )
 
                 if diffusion_sampler == "entropy-bound":
+                    acceptance_mask = _diffusion_acceptance_gate(
+                        processed_logits,
+                        _margin_threshold,
+                        committed_mask,
+                    )
+                    committed_mask = committed_mask | acceptance_mask
                     if cur_step > 1:
-                        token_entropy, next_self_conditioning_embeddings = (
-                            _diffusion_entropy_and_soft_embeddings(
-                                processed_logits,
-                                soft_embedding_weight,
-                                model.model.decoder.embed_scale,
-                            )
+                        next_self_conditioning_embeddings = _diffusion_soft_embeddings(
+                            processed_logits,
+                            soft_embedding_weight,
+                            model.model.decoder.embed_scale,
                         )
                     else:
-                        token_entropy = _diffusion_token_entropy(processed_logits)
                         next_self_conditioning_embeddings = None
-                    acceptance_mask = _diffusion_entropy_transfer_mask(
-                        token_entropy,
-                        entropy_bound,
-                    )
                     accepted_canvas = mx.where(
                         acceptance_mask,
                         denoiser_canvas,
@@ -974,6 +1039,11 @@ def stream_diffusion_generate(
                     mx.all(draft_reveal_mask).item()
                 ):
                     accepted_canvas = draft_canvas
+                    break
+
+                if diffusion_sampler == "entropy-bound" and bool(
+                    mx.all(committed_mask).item()
+                ):
                     break
 
                 if _diffusion_stable_and_confident(
