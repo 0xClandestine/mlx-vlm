@@ -990,7 +990,6 @@ def stream_diffusion_generate(
                         temperature,
                     )
                 )
-
                 if diffusion_sampler == "entropy-bound":
                     acceptance_mask = _diffusion_acceptance_gate(
                         processed_logits,
