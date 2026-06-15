@@ -410,6 +410,27 @@ def _diffusion_soft_embeddings(
     ) * embed_scale
 
 
+def _diffusion_freeze_committed_logits(
+    logits: mx.array,
+    argmax_ids: mx.array,
+    committed_mask: mx.array,
+) -> mx.array:
+    """Return logits with committed positions replaced by a one-hot distribution.
+
+    For each committed position (b, l), sets all logit values to -inf except
+    the argmax token, which is set to 0.  softmax of the result is the exact
+    embedding row for that token — no noise from the rest of the vocabulary
+    leaks into the self-conditioning matmul.
+    """
+    sharp = mx.put_along_axis(
+        mx.full(logits.shape, float("-inf"), dtype=mx.float32),
+        argmax_ids[..., None],
+        mx.zeros((*argmax_ids.shape, 1), dtype=mx.float32),
+        axis=-1,
+    )
+    return mx.where(committed_mask[..., None], sharp, logits.astype(mx.float32))
+
+
 def _diffusion_confidence_transfer_mask(
     confidence: mx.array,
     unrevealed_mask: mx.array,
@@ -954,8 +975,11 @@ def stream_diffusion_generate(
                     )
                     committed_mask = committed_mask | acceptance_mask
                     if cur_step > 1:
+                        sc_logits = _diffusion_freeze_committed_logits(
+                            processed_logits, argmax_canvas, committed_mask
+                        )
                         next_self_conditioning_embeddings = _diffusion_soft_embeddings(
-                            processed_logits,
+                            sc_logits,
                             soft_embedding_weight,
                             model.model.decoder.embed_scale,
                         )
