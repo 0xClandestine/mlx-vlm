@@ -967,7 +967,7 @@ def stream_diffusion_generate(
                         current_canvas,
                     )
                     current_canvas = mx.where(
-                        acceptance_mask,
+                        committed_mask,
                         accepted_canvas,
                         _diffusion_initialize_canvas(
                             batch_size,
@@ -976,7 +976,7 @@ def stream_diffusion_generate(
                             input_ids.dtype,
                         ),
                     )
-                    draft_reveal_mask = acceptance_mask
+                    draft_reveal_mask = committed_mask
                     draft_canvas = argmax_canvas
                 else:
                     next_self_conditioning_embeddings = None
