@@ -360,6 +360,29 @@ def _diffusion_acceptance_gate(
     return (top2[..., 1] - top2[..., 0]) > margin_threshold
 
 
+@mx.compile
+def _diffusion_stability_gate(
+    logits: mx.array,
+    committed_mask: mx.array,
+    prev_argmax: mx.array,
+    curr_argmax: mx.array,
+    min_margin: float,
+) -> mx.array:
+    """Commit uncommitted positions whose argmax is stable across two steps
+    and whose top-1 vs top-2 logit margin exceeds min_margin.
+
+    Strictly lossless: only OR-extends the commit set already produced by
+    _diffusion_acceptance_gate.  Catches positions that have converged to a
+    stable token but whose entropy hasn't fully dropped below the threshold.
+
+    min_margin must be > 0 (using bare "> 0" fires too aggressively at
+    temperature=0 because argmax is deterministic across flat distributions).
+    """
+    active = mx.where(committed_mask[..., None], -mx.inf, logits.astype(mx.float32))
+    top2 = mx.topk(active, k=2, axis=-1)
+    return (curr_argmax == prev_argmax) & ((top2[..., 1] - top2[..., 0]) > min_margin)
+
+
 def _diffusion_soft_embedding_weight(embed_tokens: nn.Module) -> mx.array:
     """Return a float weight matrix usable as ``probs @ weight``.
 
@@ -872,6 +895,7 @@ def stream_diffusion_generate(
             # Tracks positions accepted in any prior step of this canvas so
             # _diffusion_acceptance_gate can skip them entirely.
             committed_mask = mx.zeros((batch_size, canvas_length), dtype=mx.bool_)
+            prev_argmax_canvas = None
             draft_canvas = current_canvas
             accepted_canvas = current_canvas
             argmax_canvas = current_canvas
@@ -973,6 +997,15 @@ def stream_diffusion_generate(
                         _margin_threshold,
                         committed_mask,
                     )
+                    if prev_argmax_canvas is not None:
+                        acceptance_mask = acceptance_mask | _diffusion_stability_gate(
+                            processed_logits,
+                            committed_mask,
+                            prev_argmax_canvas,
+                            argmax_canvas,
+                            _margin_threshold * 0.5,
+                        )
+                    prev_argmax_canvas = argmax_canvas
                     committed_mask = committed_mask | acceptance_mask
                     if cur_step > 1:
                         sc_logits = _diffusion_freeze_committed_logits(
